@@ -1,4 +1,4 @@
-import { MarkdownRenderChild, Plugin, Vault, MarkdownPostProcessorContext, PluginSettingTab, App, Setting, Component } from 'obsidian';
+import { MarkdownRenderChild, Plugin, Vault, MarkdownPostProcessorContext, PluginSettingTab, App, Setting, Component, MarkdownPostProcessor } from 'obsidian';
 import { renderErrorPre, renderList, renderTable, renderValue } from 'src/ui/render';
 import { FullIndex } from 'src/data/index';
 import * as Tasks from 'src/ui/tasks';
@@ -43,8 +43,8 @@ export default class DataviewPlugin extends Plugin {
 			this.prepareIndexes();
 		}
 
-		// Main entry point for dataview.
-		this.registerMarkdownCodeBlockProcessor("dataview", async (source: string, el, ctx) => {
+        // Dataview query language code blocks.
+		this.registerHighPriorityCodeblockProcessor("dataview", async (source: string, el, ctx) => {
 			let maybeQuery = tryOrPropogate(() => parseQuery(source, this.settings));
 
 			// In case of parse error, just render the error.
@@ -70,8 +70,8 @@ export default class DataviewPlugin extends Plugin {
 			}
 		});
 
-		// Main entry point for Dataview.
-		this.registerMarkdownCodeBlockProcessor("dataviewjs", async (source: string, el, ctx) => {
+        // DataviewJS codeblocks.
+		this.registerHighPriorityCodeblockProcessor("dataviewjs", async (source: string, el, ctx) => {
 			ctx.addChild(this.wrapWithEnsureIndex(ctx, el,
 				() => new DataviewJSRenderer(source, el, this.app, this.index, ctx.sourcePath, this.settings)));
 		});
@@ -81,7 +81,7 @@ export default class DataviewPlugin extends Plugin {
 			// Search for <code> blocks inside this element; for each one, look for things of the form `= ...`.
 			let codeblocks = el.querySelectorAll("code");
 			for (let index = 0; index < codeblocks.length; index++) {
-				let codeblock = codeblocks.item(index);
+                let codeblock = codeblocks.item(index);
 
 				let text = codeblock.innerText.trim();
                 if (text.startsWith(this.settings.inlineJsQueryPrefix)) {
@@ -103,8 +103,38 @@ export default class DataviewPlugin extends Plugin {
                 }
 			}
 		});
-
 	}
+
+    /**
+     * Utility function for registering high priority codeblocks which run before any other post processing, such as
+     * emoji-twitter.
+     */
+    public registerHighPriorityCodeblockProcessor(language: string, processor: (source: string, el: HTMLElement, ctx: MarkdownPostProcessorContext) => Promise<void>) {
+        let postProcess: MarkdownPostProcessor = async (el, ctx) => {
+            let codeblocks = el.querySelectorAll("pre > code");
+            if (!codeblocks) return;
+
+            for (let index = 0; index < codeblocks.length; index++) {
+                let codeblock = codeblocks.item(index) as HTMLElement;
+                let clanguages = Array.from(codeblock.classList)
+                    .filter(c => c.startsWith("language-"))
+                    .map(c => c.substring("language-".length));
+
+                if (!clanguages.contains(language)) continue;
+                if (!codeblock.parentElement) continue;
+
+                let code = codeblock.innerText;
+
+                // We know the parent element is a pre, replace it.
+                let replacement = document.createElement("div");
+                codeblock.parentElement.replaceWith(replacement);
+
+                await processor(code, replacement, ctx);
+            }
+        };
+        postProcess.sortOrder = -100;
+        this.registerMarkdownPostProcessor(postProcess);
+    }
 
 	onunload() { }
 
@@ -185,6 +215,13 @@ class DataviewSettingsTab extends PluginSettingTab {
 					parsed = (parsed < 100) ? 100 : parsed;
 					await this.plugin.updateSettings({ refreshInterval: parsed });
 				}));
+
+		new Setting(this.containerEl)
+			.setName("Enable JavaScript Queries")
+			.setDesc("Enable or disable executing DataviewJS queries.")
+			.addToggle(toggle =>
+				toggle.setValue(this.plugin.settings.enableDataviewJs)
+					.onChange(async (value) => await this.plugin.updateSettings({ enableDataviewJs: value })));
 	}
 }
 
@@ -457,10 +494,16 @@ class DataviewJSRenderer extends MarkdownRenderChild {
 	}
 
     async render() {
+		if (!this.settings.enableDataviewJs) {
+			this.containerEl.innerHTML = "";
+			renderErrorPre(this.container, "Dataview JS queries are disabled.");
+			return;
+		}
+
 		// Assume that the code is javascript, and try to eval it.
 		try {
-			evalInContext(DataviewJSRenderer.PREAMBLE + this.script,
-				makeApiContext(this.index, this, this.app, this.settings, this.container, this.origin));
+		    evalInContext(DataviewJSRenderer.PREAMBLE + this.script,
+			    makeApiContext(this.index, this, this.app, this.settings, this.container, this.origin));
 		} catch (e) {
 			this.containerEl.innerHTML = "";
 			renderErrorPre(this.container, "Evaluation Error: " + e.stack);
@@ -496,11 +539,19 @@ class DataviewInlineJSRenderer extends MarkdownRenderChild {
 	}
 
     async render() {
+		if (!this.settings.enableDataviewJs) {
+            let temp = document.createElement("span");
+            temp.innerText = "<disabled>";
+            this.target.replaceWith(temp);
+            this.target = temp;
+            return;
+		}
+
 		// Assume that the code is javascript, and try to eval it.
 		try {
             let temp = document.createElement("span");
-			let result = evalInContext(DataviewInlineJSRenderer.PREAMBLE + this.script,
-				makeApiContext(this.index, this, this.app, this.settings, temp, this.origin));
+		    let result = evalInContext(DataviewInlineJSRenderer.PREAMBLE + this.script,
+		    	makeApiContext(this.index, this, this.app, this.settings, temp, this.origin));
             this.target.replaceWith(temp);
             this.target = temp;
             if (result === undefined) return;
